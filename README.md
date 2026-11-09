@@ -46,7 +46,7 @@ Ensure your local system has Git and Python 3.10+ configured.
 ### Installation and Local Setup
 ```bash
 # Clone the repository
-git clone https://github.com
+git clone https://github.com/axomiyaindie/karapathy-loop.git
 cd karapathy-loop
 
 # Install package dependencies
