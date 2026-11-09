@@ -1,0 +1,10 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# RSI Agent Specific Ignores
+.agent_sandbox/      # Directory where mutated code is tested
+.agent_mutations/    # History logs of failed or rolled-back code variants
+agent_skills/cache/  # Dynamically generated skill playbooks
+.env                 # API keys (OpenAI, Anthropic, etc.)
