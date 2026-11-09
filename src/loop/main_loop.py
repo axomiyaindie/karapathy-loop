@@ -1,181 +1,1014 @@
-﻿import os
-import sys
+"""Mutation supervisor with candidate-specific, container-isolated evaluation."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
 import re
+import shutil
 import subprocess
-from typing import Dict, Any
+import sys
+import tempfile
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
 from dotenv import load_dotenv
 
-# Ensure local custom imports function cleanly
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# SHA-256 of UTF-8 source after BOM removal and newline normalization.
+# Stable across Windows, Linux, and macOS line-ending conventions.
+TRUSTED_EVALUATOR_HASHES = {
+    "immutable_ruler.py": (
+        "2196196ACBC7F43FD9642C187A5C9ED5B3AF9397EBD0A65F96B60D6F1C1797B5"
+    ),
+    "run_challenge.py": (
+        "89EBE1730AAB81A311F24C2214E3DF3F7452A8F6DFB1FC49A7733880ED05C77D"
+    ),
+}
+
+if str(PROJECT_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
 from context.engine import ContextEngine
 
-# Load runtime environment variables
-load_dotenv()
 
 class KarpathyLoop:
-    def __init__(self, agent_src_path: str, eval_suite_path: str):
-        self.agent_src_path = agent_src_path
-        self.eval_suite_path = eval_suite_path
-        self.generation = int(os.environ.get("AGENT_GEN", "1"))
-        self.context_engine = ContextEngine(token_limit=3500)
-        
-    def get_current_agent_code(self) -> str:
-        if os.path.exists(self.agent_src_path):
-            with open(self.agent_src_path, 'r', encoding='utf-8') as f:
-                return f.read()
-        return "# Baseline Initial Agent\ndef execute_task(ctx):\n    return True\n"
+    """Coordinate mutation, dual-stage evaluation, and guarded promotion."""
 
-    def query_live_llm(self, system_prompt: str, user_content: str) -> str:
-        provider = os.environ.get("RSI_LLM_PROVIDER", "anthropic").lower()
-        
-        if provider == "anthropic" and os.environ.get("ANTHROPIC_API_KEY"):
-            from anthropic import Anthropic
-            print("[LLM Engine] Querying Claude API for system optimizations...")
-            client = Anthropic()
-            message = client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=2048,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_content}]
+    def __init__(
+        self,
+        agent_src_path: str = "src/agent/live_agent.py",
+        eval_suite_path: str = "tests/immutable_ruler.py",
+        *,
+        token_limit: int | None = None,
+        push_remote: bool | None = None,
+    ) -> None:
+        load_dotenv(PROJECT_ROOT / ".env")
+
+        self.project_root = PROJECT_ROOT
+        self.agent_src_path = self._project_path(agent_src_path)
+        self.eval_suite_path = self._project_path(eval_suite_path)
+        self.challenge_path = self._project_path("tests/run_challenge.py")
+
+        self.sandbox_dir = self.project_root / ".agent_sandbox"
+        self.sandbox_file = self.sandbox_dir / "temp_agent.py"
+        self.mutation_archive_dir = self.project_root / ".agent_mutations"
+
+        self.generation = self._read_generation()
+
+        self.token_limit = (
+            token_limit
+            if token_limit is not None
+            else int(os.environ.get("RSI_TOKEN_LIMIT", "3500"))
+        )
+
+        self.request_token_limit = self._positive_int(
+            "RSI_REQUEST_TOKEN_LIMIT", 16000
+        )
+        self.output_token_reserve = 2048
+
+        self.context_engine = ContextEngine(token_limit=self.token_limit)
+
+        self.max_cycles = self._positive_int("RSI_MAX_CYCLES", 3)
+        self.evaluation_timeout = self._positive_int(
+            "RSI_EVALUATION_TIMEOUT", 120
+        )
+
+        self.push_remote = (
+            push_remote
+            if push_remote is not None
+            else os.environ.get("RSI_AUTO_PUSH", "false").lower() == "true"
+        )
+
+        self.auto_commit = (
+            os.environ.get("RSI_AUTO_COMMIT", "false").lower() == "true"
+        )
+
+        self.docker = shutil.which("docker")
+
+        if not self.eval_suite_path.is_file() or not self.challenge_path.is_file():
+            raise FileNotFoundError(
+                "Both protected evaluation scripts are required."
             )
-            return message.content.text
-            
-        elif provider == "openai" and os.environ.get("OPENAI_API_KEY"):
-            from openai import OpenAI
-            print("[LLM Engine] Querying OpenAI GPT-4o API for system optimizations...")
-            client = OpenAI()
-            completion = client.chat.completions.create(
-                model="gpt-4o",
+
+        if not self.agent_src_path.parent.is_dir():
+            raise FileNotFoundError(
+                f"Agent source directory not found: {self.agent_src_path.parent}"
+            )
+
+    @staticmethod
+    def _positive_int(name: str, default: int) -> int:
+        try:
+            value = int(os.environ.get(name, str(default)))
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a positive integer") from exc
+
+        if value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+
+        return value
+
+    def _project_path(self, path: str | Path) -> Path:
+        candidate = Path(path)
+
+        resolved = (
+            candidate
+            if candidate.is_absolute()
+            else self.project_root / candidate
+        ).resolve()
+
+        try:
+            resolved.relative_to(self.project_root)
+        except ValueError as exc:
+            raise PermissionError(
+                f"Project path escapes repository root: {path}"
+            ) from exc
+
+        return resolved
+
+    @staticmethod
+    def _read_generation() -> int:
+        try:
+            generation = int(os.environ.get("AGENT_GEN", "1"))
+        except ValueError as exc:
+            raise ValueError(
+                "AGENT_GEN must be a positive integer"
+            ) from exc
+
+        if generation < 1:
+            raise ValueError("AGENT_GEN must be a positive integer")
+
+        return generation
+
+    def _relative(self, path: Path) -> str:
+        return path.relative_to(self.project_root).as_posix()
+
+    @staticmethod
+    def _normalized_source_hash(content: bytes) -> str:
+        """Hash UTF-8 source consistently across operating systems."""
+        text = content.decode("utf-8-sig")
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+
+        return hashlib.sha256(
+            normalized.encode("utf-8")
+        ).hexdigest().upper()
+
+    def _load_verified_evaluators(self) -> dict[str, bytes]:
+        """Verify trusted evaluator source and return the exact verified bytes."""
+
+        expected_paths = {
+            "immutable_ruler.py": (
+                self.project_root / "tests" / "immutable_ruler.py"
+            ),
+            "run_challenge.py": (
+                self.project_root / "tests" / "run_challenge.py"
+            ),
+        }
+
+        if (
+            self.eval_suite_path
+            != expected_paths["immutable_ruler.py"].resolve()
+        ):
+            raise PermissionError(
+                "The configured immutable evaluator path is not trusted."
+            )
+
+        if (
+            self.challenge_path
+            != expected_paths["run_challenge.py"].resolve()
+        ):
+            raise PermissionError(
+                "The configured challenge evaluator path is not trusted."
+            )
+
+        verified: dict[str, bytes] = {}
+
+        for name, path in expected_paths.items():
+            try:
+                content = path.read_bytes()
+                actual_hash = self._normalized_source_hash(content)
+
+            except (OSError, UnicodeError) as exc:
+                raise RuntimeError(
+                    f"Cannot read protected evaluator: {name}"
+                ) from exc
+
+            expected_hash = TRUSTED_EVALUATOR_HASHES[name]
+
+            if actual_hash != expected_hash:
+                raise PermissionError(
+                    f"Protected evaluator integrity check failed: {name}. "
+                    "Evaluation has been stopped."
+                )
+
+            verified[name] = content
+
+        return verified
+
+    def get_current_agent_code(self) -> str:
+        return self.agent_src_path.read_text(encoding="utf-8")
+
+    def query_live_llm(
+        self,
+        system_prompt: str,
+        user_content: str,
+    ) -> str:
+
+        provider = os.environ.get(
+            "RSI_LLM_PROVIDER", "anthropic"
+        ).strip().lower()
+
+        if provider == "anthropic":
+            if not os.environ.get("ANTHROPIC_API_KEY"):
+                raise RuntimeError("ANTHROPIC_API_KEY is not configured")
+
+            model = os.environ.get("ANTHROPIC_MODEL", "").strip()
+
+            if not model:
+                raise RuntimeError("ANTHROPIC_MODEL must be configured")
+
+            from anthropic import Anthropic
+
+            response = Anthropic().messages.create(
+                model=model,
+                max_tokens=self.output_token_reserve,
+                system=system_prompt,
                 messages=[
-                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content}
                 ],
-                max_tokens=2048
             )
-            return completion.choices.message.content
+
+            blocks = [
+                block.text
+                for block in response.content
+                if getattr(block, "type", None) == "text"
+            ]
+
+            text = "\n".join(blocks)
+
+        elif provider == "openai":
+            if not os.environ.get("OPENAI_API_KEY"):
+                raise RuntimeError("OPENAI_API_KEY is not configured")
+
+            model = os.environ.get("OPENAI_MODEL", "").strip()
+
+            if not model:
+                raise RuntimeError("OPENAI_MODEL must be configured")
+
+            from openai import OpenAI
+
+            response = OpenAI().chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                max_tokens=self.output_token_reserve,
+            )
+
+            text = response.choices[0].message.content or ""
+
         else:
-            raise ValueError(f"Selected provider '{provider}' key or dependencies missing. Reverting to fallback.")
+            raise ValueError(
+                f"Unsupported RSI_LLM_PROVIDER '{provider}'"
+            )
+
+        if not text.strip():
+            raise RuntimeError(
+                f"{provider} returned an empty response"
+            )
+
+        return text
+
+    @staticmethod
+    def _extract_python_code(response: str) -> str:
+        matches = re.findall(
+            r"```(?:python|py)?\s*(.*?)```",
+            response,
+            re.S | re.I,
+        )
+
+        code = matches[0].strip() if matches else response.strip()
+
+        if not code:
+            raise ValueError(
+                "The mutation response contained no Python code"
+            )
+
+        return code + "\n"
 
     def propose_mutation(self, feedback: str) -> str:
-        print(f"\n[Gen {self.generation}] Assembling telemetry context and querying structural mutation...")
-        current_code = self.get_current_agent_code()
-        compressed_history = self.context_engine.compress_context()
-        
-        system_prompt = """You are an elite recursive self-improvement software agent operating inside a Karpathy Loop. 
-Your goal is to optimize the 'execute_task(ctx)' function inside the provided Python script.
-CRITICAL CONTRACT CONSTRAINTS:
-1. You must ONLY output a single, complete block of executable Python code enclosed in markdown code fences: ```python ... ```
-2. The code MUST contain an 'execute_task(ctx)' function interface.
-3. The function MUST return a Boolean value (True/False)."""
+        system = (
+            "Return one complete Python module defining execute_task(ctx). "
+            "It must return a real bool on every path and set "
+            "loop_stability_factor in ctx. "
+            "Do not include credentials or modify evaluation/supervisor files."
+        )
 
-        user_content = f"{compressed_history}\n\nCurrent Live Code Baseline:\n```python\n{current_code}\n```\n\nFeedback:\n{feedback}"
+        user = (
+            f"{self.context_engine.compress_context()}\n\n"
+            f"Current agent:\n"
+            f"```python\n{self.get_current_agent_code()}\n```\n\n"
+            f"Feedback:\n{feedback}"
+        )
+
+        estimated = self.context_engine.count_tokens(
+            system + "\n" + user
+        )
+
+        if (
+            estimated + self.output_token_reserve
+            > self.request_token_limit
+        ):
+            raise ValueError(
+                "Mutation prompt plus reserved completion exceeds "
+                "RSI_REQUEST_TOKEN_LIMIT "
+                f"({estimated} + {self.output_token_reserve} "
+                f"> {self.request_token_limit})"
+            )
+
+        # API/auth/rate-limit errors are surfaced.
+        # They never become a fake candidate.
+        return self._extract_python_code(
+            self.query_live_llm(system, user)
+        )
+
+    @staticmethod
+    def _evaluation_result(
+        name: str,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        duration: float,
+        timed_out: bool,
+    ) -> dict[str, Any]:
+
+        return {
+            "name": name,
+            "returncode": returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "duration_seconds": round(duration, 3),
+            "timed_out": timed_out,
+            "passed": returncode == 0 and not timed_out,
+        }
+
+    def _run_container_evaluator(
+        self,
+        workspace: Path,
+        script: str,
+    ) -> dict[str, Any]:
+
+        name = Path(script).name
+
+        if not self.docker:
+            return self._evaluation_result(
+                name,
+                -1,
+                "",
+                "Docker is required for candidate evaluation.",
+                0,
+                False,
+            )
+
+        image = os.environ.get(
+            "RSI_SANDBOX_IMAGE", "python:3.12-slim"
+        )
+
+        container_name = f"rsi-eval-{uuid.uuid4().hex}"
+
+        command = [
+            self.docker,
+            "run",
+            "--rm",
+            "--name",
+            container_name,
+            "--network=none",
+            "--read-only",
+            "--cpus=0.5",
+            "--memory=256m",
+            "--pids-limit=64",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--user=65534:65534",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,size=16m",
+            "--mount",
+            f"type=bind,src={workspace.resolve()},dst=/workspace,readonly",
+            "--workdir",
+            "/workspace",
+            image,
+            "python",
+            script,
+        ]
+
+        start = time.monotonic()
 
         try:
-            raw_response = self.query_live_llm(system_prompt, user_content)
-            code_match = re.search(r"```python(.*?)```", raw_response, re.DOTALL)
-            if code_match:
-                return code_match.group(1).strip()
-            return raw_response.strip()
+            result = subprocess.run(
+                command,
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.evaluation_timeout,
+                check=False,
+                shell=False,
+            )
+
+            return self._evaluation_result(
+                name,
+                result.returncode,
+                result.stdout,
+                result.stderr,
+                time.monotonic() - start,
+                False,
+            )
+
+        except subprocess.TimeoutExpired as exc:
+            try:
+                subprocess.run(
+                    [
+                        self.docker,
+                        "rm",
+                        "--force",
+                        container_name,
+                    ],
+                    cwd=self.project_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                    shell=False,
+                )
+
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+            out = (
+                exc.stdout.decode("utf-8", "replace")
+                if isinstance(exc.stdout, bytes)
+                else (exc.stdout or "")
+            )
+
+            err = (
+                exc.stderr.decode("utf-8", "replace")
+                if isinstance(exc.stderr, bytes)
+                else (exc.stderr or "")
+            )
+
+            return self._evaluation_result(
+                name,
+                -1,
+                out,
+                err,
+                time.monotonic() - start,
+                True,
+            )
+
+        except OSError as exc:
+            return self._evaluation_result(
+                name,
+                -1,
+                "",
+                str(exc),
+                time.monotonic() - start,
+                False,
+            )
+
+    def sandbox_evaluate(
+        self,
+        mutated_code: str,
+    ) -> dict[str, Any]:
+
+        """Run both verified rubrics against the same candidate in Docker."""
+
+        digest = hashlib.sha256(
+            mutated_code.encode("utf-8")
+        ).hexdigest()
+
+        with tempfile.TemporaryDirectory(
+            prefix="karpathy-eval-"
+        ) as temp:
+
+            root = Path(temp)
+
+            (root / "tests").mkdir()
+            (root / ".agent_sandbox").mkdir()
+            (root / "src" / "agent").mkdir(parents=True)
+
+            # Verify both evaluators before copying either one.
+            # The exact verified bytes are used in the Docker workspace.
+            verified_evaluators = self._load_verified_evaluators()
+
+            (
+                root / "tests" / "immutable_ruler.py"
+            ).write_bytes(
+                verified_evaluators["immutable_ruler.py"]
+            )
+
+            (
+                root / "tests" / "run_challenge.py"
+            ).write_bytes(
+                verified_evaluators["run_challenge.py"]
+            )
+
+            (
+                root / ".agent_sandbox" / "temp_agent.py"
+            ).write_text(
+                mutated_code,
+                encoding="utf-8",
+            )
+
+            (
+                root / "src" / "agent" / "live_agent.py"
+            ).write_text(
+                mutated_code,
+                encoding="utf-8",
+            )
+
+            ruler = self._run_container_evaluator(
+                root,
+                "tests/immutable_ruler.py",
+            )
+
+            challenge = self._run_container_evaluator(
+                root,
+                "tests/run_challenge.py",
+            )
+
+            return {
+                "passed": (
+                    ruler["passed"] and challenge["passed"]
+                ),
+                "candidate_sha256": digest,
+                "evaluations": [ruler, challenge],
+                "feedback": "\n".join(
+                    f"[{result['name']}] "
+                    f"exit={result['returncode']} "
+                    f"timeout={result['timed_out']} "
+                    f"duration={result['duration_seconds']}s\n"
+                    f"{result['stdout']}{result['stderr']}"
+                    for result in (ruler, challenge)
+                ),
+            }
+
+    def archive_failed_mutation(
+        self,
+        mutated_code: str,
+        feedback: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> Path:
+
+        self.mutation_archive_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        timestamp = datetime.now(timezone.utc).strftime(
+            "%Y%m%dT%H%M%SZ"
+        )
+
+        digest = hashlib.sha256(
+            mutated_code.encode("utf-8")
+        ).hexdigest()
+
+        stem = f"generation_{self.generation:04d}_{timestamp}"
+
+        suffix = 0
+
+        while True:
+            extra = f"_{suffix}" if suffix else ""
+
+            code_path = (
+                self.mutation_archive_dir
+                / f"{stem}{extra}.py"
+            )
+
+            log_path = (
+                self.mutation_archive_dir
+                / f"{stem}{extra}.log"
+            )
+
+            if not code_path.exists() and not log_path.exists():
+                break
+
+            suffix += 1
+
+        code_path.write_text(
+            self._redact_sensitive(mutated_code),
+            encoding="utf-8",
+        )
+
+        record = {
+            "generation": self.generation,
+            "timestamp_utc": timestamp,
+            "candidate_sha256": digest,
+            "failure_reason": self._redact_sensitive(feedback),
+            "promotion_attempted": bool(
+                (metadata or {}).get("promotion_attempted", False)
+            ),
+            "evaluator_results": (
+                (metadata or {}).get("evaluations", [])
+            ),
+        }
+
+        safe_record = json.loads(
+            self._redact_sensitive(
+                json.dumps(record, ensure_ascii=False)
+            )
+        )
+
+        log_path.write_text(
+            json.dumps(
+                safe_record,
+                indent=2,
+                ensure_ascii=False,
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        return code_path
+
+    @staticmethod
+    def _secret_patterns() -> tuple[tuple[str, str], ...]:
+        """Return patterns for detecting and redacting common credentials."""
+
+        return (
+            (
+                r"""(?i)\b(?:api[_-]?key|access[_-]?key|secret[_-]?key|"""
+                r"""client[_-]?secret|password|passwd|token|auth[_-]?token|"""
+                r"""credential|private[_-]?key)\b\s*[:=]\s*"""
+                r"""(['"])[^'"\r\n]{8,}\1""",
+                "[REDACTED_CREDENTIAL_ASSIGNMENT]",
+            ),
+            (
+                r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{12,}=*",
+                "Bearer [REDACTED_TOKEN]",
+            ),
+            (r"\bsk-[A-Za-z0-9_-]{20,}\b", "[REDACTED_SECRET_TOKEN]"),
+            (r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", "[REDACTED_GITHUB_TOKEN]"),
+            (r"\bgh[pousr]_[A-Za-z0-9]{20,}\b", "[REDACTED_GITHUB_TOKEN]"),
+            (r"\bAIza[0-9A-Za-z_-]{30,}\b", "[REDACTED_GOOGLE_API_KEY]"),
+            (r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", "[REDACTED_SLACK_TOKEN]"),
+            (r"\bAKIA[0-9A-Z]{16}\b", "[REDACTED_AWS_ACCESS_KEY]"),
+            (
+                r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
+                r".*?"
+                r"-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+                "[REDACTED_PRIVATE_KEY]",
+            ),
+        )
+
+    def _redact_sensitive(self, text: str) -> str:
+        """Redact recognizable credentials before archiving data."""
+
+        redacted = text
+        for pattern, replacement in self._secret_patterns():
+            redacted = re.sub(pattern, replacement, redacted, flags=re.DOTALL)
+
+        secret_markers = ("key", "token", "secret", "password", "credential")
+        for name, value in os.environ.items():
+            if (
+                value
+                and len(value) >= 8
+                and any(marker in name.casefold() for marker in secret_markers)
+            ):
+                redacted = redacted.replace(value, "[REDACTED_ENV_VALUE]")
+
+        return redacted
+
+    def _git(
+        self,
+        *args: str,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+
+        return subprocess.run(
+            ["git", *args],
+            cwd=self.project_root,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=check,
+            shell=False,
+        )
+
+    def _validate_git_state(self) -> str:
+        self._git("rev-parse", "--show-toplevel")
+
+        branch = self._git(
+            "branch",
+            "--show-current",
+        ).stdout.strip()
+
+        if not branch:
+            raise RuntimeError(
+                "Cannot promote from a detached HEAD"
+            )
+
+        self._git(
+            "check-ref-format",
+            "--branch",
+            branch,
+        )
+
+        remotes = self._git("remote").stdout.splitlines()
+
+        if "origin" not in remotes:
+            raise RuntimeError(
+                "Git remote 'origin' is not configured"
+            )
+
+        if not self._git(
+            "remote",
+            "get-url",
+            "origin",
+        ).stdout.strip():
+            raise RuntimeError(
+                "Git remote 'origin' has no URL"
+            )
+
+        staged = self._git(
+            "diff",
+            "--cached",
+            "--name-only",
+        ).stdout.splitlines()
+
+        target = self._relative(self.agent_src_path)
+
+        if staged:
+            raise RuntimeError(
+                "Refusing to commit while the Git index has staged changes"
+            )
+
+        status = self._git(
+            "status",
+            "--porcelain",
+            "--",
+            target,
+        ).stdout.strip()
+
+        if status:
+            raise RuntimeError(
+                f"Production target has pre-existing Git changes: {target}"
+            )
+
+        return branch
+
+    def _reject_secret_like_code(self, code: str) -> None:
+        """Reject candidate code containing recognizable credentials."""
+
+        for pattern, _replacement in self._secret_patterns():
+            if re.search(pattern, code, flags=re.DOTALL):
+                raise PermissionError(
+                    "Candidate appears to contain credentials or private "
+                    "key material; promotion blocked."
+                )
+
+        secret_markers = ("key", "token", "secret", "password", "credential")
+        for name, value in os.environ.items():
+            if (
+                value
+                and len(value) >= 8
+                and any(marker in name.casefold() for marker in secret_markers)
+                and value in code
+            ):
+                raise PermissionError(
+                    "Candidate contains a configured secret value; "
+                    "promotion blocked."
+                )
+
+    def _atomic_write_agent(self, code: str) -> None:
+        temporary = self.agent_src_path.with_suffix(
+            self.agent_src_path.suffix + ".rsi-tmp"
+        )
+
+        try:
+            temporary.write_text(
+                code,
+                encoding="utf-8",
+            )
+
+            shutil.copystat(
+                self.agent_src_path,
+                temporary,
+            )
+
+            os.replace(
+                temporary,
+                self.agent_src_path,
+            )
+
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def commit_improvement(
+        self,
+        mutated_code: str,
+        tested_hash: str,
+    ) -> bool:
+
+        """Commit only the tested candidate; optional push follows current branch."""
+
+        digest = hashlib.sha256(
+            mutated_code.encode("utf-8")
+        ).hexdigest()
+
+        if digest != tested_hash:
+            raise RuntimeError(
+                "Candidate hash differs from the evaluated source"
+            )
+
+        self._reject_secret_like_code(mutated_code)
+
+        branch = self._validate_git_state()
+
+        previous = self.get_current_agent_code()
+
+        previous_head = self._git(
+            "rev-parse",
+            "HEAD",
+        ).stdout.strip()
+
+        self._atomic_write_agent(mutated_code)
+
+        staged = False
+
+        try:
+            self._git(
+                "add",
+                "--",
+                self._relative(self.agent_src_path),
+            )
+
+            staged = True
+
+            self._git(
+                "commit",
+                "-m",
+                f"RSI: generation {self.generation} validated",
+            )
+
         except Exception:
-            print(f"[LLM Engine Info] Live compilation token not available. Running local simulation variant.")
+            current_head = self._git(
+                "rev-parse",
+                "HEAD",
+                check=False,
+            ).stdout.strip()
 
-        # Simulate a slight code structural break on Round 2 for testing rollback recovery workflows safely
-        if self.generation == 2:
-            return """# Generation 2 - Intentionally Broken Syntax Variant
-def execute_task(ctx):
-    print("--- Gen 2 Breaking Protocol ---"
-    # Missing closing parenthesis above will trigger a parse syntax failure!
-    return True
-"""
+            if current_head != previous_head:
+                # A hook may fail after Git already recorded the commit.
+                raise
 
-        return f"""# Generation {self.generation} - Autonomous Evolution Path
-def execute_task(ctx):
-    print("--- Gen {self.generation} Active Engine Running ---")
-    ctx['generation_telemetry'] = {self.generation}
-    ctx['loop_stability_factor'] = 0.95 + ({self.generation} * 0.01)
-    return True
-"""
+            self._atomic_write_agent(previous)
 
-    def sandbox_evaluate(self, mutated_code: str) -> Dict[str, Any]:
-        sandbox_dir = ".agent_sandbox"
-        os.makedirs(sandbox_dir, exist_ok=True)
-        sandbox_file = os.path.join(sandbox_dir, "temp_agent.py")
-        
-        with open(sandbox_file, "w", encoding='utf-8') as f:
-            f.write(mutated_code)
-            
-        print(f"[Gen {self.generation}] Invoking Immutable Ruler verification pipeline...")
-        result = subprocess.run([sys.executable, self.eval_suite_path], capture_output=True, text=True)
-        
-        passed = result.returncode == 0
-        feedback = result.stdout + result.stderr
-        return {"passed": passed, "feedback": feedback}
+            if staged:
+                self._git(
+                    "restore",
+                    "--staged",
+                    "--",
+                    self._relative(self.agent_src_path),
+                    check=False,
+                )
 
-    def commit_improvement(self, mutated_code: str):
-        print(f"[Gen {self.generation}] Validation Passed! Committing code change permanently.")
-        os.makedirs(os.path.dirname(self.agent_src_path), exist_ok=True)
-        with open(self.agent_src_path, "w", encoding='utf-8') as f:
-            f.write(mutated_code)
-            
+            raise
+
+        if self.push_remote:
+            try:
+                self._git(
+                    "push",
+                    "--set-upstream",
+                    "origin",
+                    branch,
+                )
+
+            except Exception as exc:
+                print(
+                    f"[Git Warning] Local commit retained; push failed: {exc}"
+                )
+                return False
+
+        return True
+
+
+    def run_iteration(
+        self,
+        baseline_feedback: str = "Improve safe telemetry handling.",
+    ) -> bool:
+
+        self.context_engine.add_interaction(
+            "system",
+            f"Starting generation {self.generation}.",
+        )
+
+        code: str | None = None
+        evaluation: dict[str, Any] = {}
+
         try:
-            print(f"[Git Sync Engine] Staging configuration changes...")
-            subprocess.run(["git", "add", self.agent_src_path], check=True, capture_output=True)
-            subprocess.run(["git", "commit", "-m", f"RSI Engine Update: Generation {self.generation}"], check=True, capture_output=True)
-            print(f"[Git Sync Engine Hub] Version record checkpoint finalized.")
-            
-            print(f"[Git Cloud Sync] Broadcasting Generation {self.generation} mutations to GitHub upstream...")
-            subprocess.run(["git", "push", "origin", "main"], check=True, capture_output=True)
-            print(f"[Git Cloud Sync] Cloud push sync completed successfully.")
-        except Exception as e:
-            print(f"[Git Sync Engine Warning] Could not finalize repository push: {e}")
+            code = self.propose_mutation(baseline_feedback)
 
-    def handle_degeneration_rollback(self, failure_feedback: str):
-        """
-        NATIVE AUTONOMOUS ROLLBACK ENGINE
-        If code verification breaks, perform a hard reset to return the 
-        workspace files cleanly to the last stable Git commit checkpoint.
-        """
-        print(f"\n[CRITICAL ERROR] Gen {self.generation} validation broke the Immutable Ruler rubric!")
-        print(f"[Rollback Engine] Initiating automated file-system recovery sequence...")
-        try:
-            # Revert any uncommitted modifications in the master agent script
-            subprocess.run(["git", "checkout", "HEAD", "--", self.agent_src_path], check=True, capture_output=True)
-            # Purge temp sandbox execution folders
-            if os.path.exists(".agent_sandbox/temp_agent.py"):
-                os.remove(".agent_sandbox/temp_agent.py")
-            print("[Rollback Engine Hub] Git branch recovered cleanly to last known stable commit.")
-        except Exception as e:
-            print(f"[Rollback Engine Exception] System state recover crash: {e}")
+            self._reject_secret_like_code(code)
 
-    def run_iteration(self, baseline_feedback: str = "Optimize context parsing and memory structure capture."):
-        self.context_engine.add_interaction("system", f"Initializing generation pass tracking {self.generation}")
-        
-        code = self.propose_mutation(baseline_feedback)
-        res = self.sandbox_evaluate(code)
-        print(res["feedback"])
-        
-        if res["passed"]:
-            self.commit_improvement(code)
-            self.context_engine.add_interaction("ruler", f"Generation {self.generation} verified cleanly.")
+            evaluation = self.sandbox_evaluate(code)
+
+            self.context_engine.add_interaction(
+                "evaluation",
+                evaluation["feedback"],
+            )
+
+            if not evaluation["passed"]:
+                self.archive_failed_mutation(
+                    code,
+                    evaluation["feedback"],
+                    evaluation,
+                )
+                return False
+
+            if not self.auto_commit:
+                self.context_engine.add_interaction(
+                    "warning",
+                    "Both rubrics passed; promotion disabled "
+                    "(RSI_AUTO_COMMIT=false).",
+                )
+
+                print(
+                    "Both evaluators passed. "
+                    "Promotion is disabled; no Git changes were made."
+                )
+
+                self.generation += 1
+                os.environ["AGENT_GEN"] = str(self.generation)
+
+                return True
+
+            evaluation["promotion_attempted"] = True
+
+            pushed = self.commit_improvement(
+                code,
+                evaluation["candidate_sha256"],
+            )
+
+            if not pushed:
+                self.context_engine.add_interaction(
+                    "warning",
+                    "Local commit succeeded; push failed.",
+                )
+
             self.generation += 1
             os.environ["AGENT_GEN"] = str(self.generation)
+
             return True
-        else:
-            self.context_engine.add_interaction("ruler", f"Generation {self.generation} failed validation: {res['feedback']}")
-            self.handle_degeneration_rollback(res["feedback"])
+
+        except Exception as exc:
+            feedback = f"{type(exc).__name__}: {exc}"
+
+            self.context_engine.add_interaction(
+                "error",
+                feedback,
+            )
+
+            if code is not None:
+                try:
+                    self.archive_failed_mutation(
+                        code,
+                        feedback,
+                        evaluation,
+                    )
+                except OSError:
+                    pass
+
+            # A candidate that passed evaluation consumes a generation,
+            # even if its subsequent Git promotion failed.
+            if evaluation.get("passed"):
+                self.generation += 1
+                os.environ["AGENT_GEN"] = str(self.generation)
+
             return False
 
+
 if __name__ == "__main__":
-    loop = KarpathyLoop("src/agent/live_agent.py", "tests/immutable_ruler.py")
-    
-    max_cycles = 3
-    print(f"--- Launching Continuous Self-Improvement Cycle (Target: {max_cycles} generations) ---")
-    
-    for cycle in range(max_cycles):
-        print(f"\n==== STARTING EVOLUTION ROUND {cycle + 1}/{max_cycles} ====")
-        success = loop.run_iteration(f"Continuous sequence cycle round {cycle + 1}. Optimize telemetry structures.")
-        if not success:
-            print("[Supervisor Info] Evolution loop terminated safely via Rollback Engine.")
+    loop = KarpathyLoop()
+
+    print(
+        f"Starting karpathy-loop for at most {loop.max_cycles} cycles."
+    )
+
+    for cycle in range(loop.max_cycles):
+        print(
+            f"\nEvolution round {cycle + 1}/{loop.max_cycles}"
+        )
+
+        if not loop.run_iteration(
+            f"Evolution cycle {cycle + 1}. Improve telemetry safely."
+        ):
+            print(
+                "Loop stopped after a rejected or failed mutation."
+            )
             break
-            
-    print("\n--- Autonomous Multi-Generation Evolution Suite Concluded ---")

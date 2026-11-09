@@ -3,8 +3,17 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# RSI Agent Specific Ignores
-.agent_sandbox/      # Directory where mutated code is tested
-.agent_mutations/    # History logs of failed or rolled-back code variants
-agent_skills/cache/  # Dynamically generated skill playbooks
-.env                 # API keys (OpenAI, Anthropic, etc.)
+# Runtime candidates and rejected mutation archives
+.agent_sandbox/
+.agent_mutations/
+agent_skills/cache/
+
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+
+# Local Python/test artifacts
+.pytest_cache/
+.venv/
+venv/
