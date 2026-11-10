@@ -1,0 +1,36 @@
+# Normalize line endings: store LF in the repository and let Git
+# convert for the working copy. This removes the "CRLF will be
+# replaced by LF" warnings on Windows.
+* text=auto
+
+# Source code, docs and config: always LF
+*.py            text eol=lf
+*.md            text eol=lf
+*.txt           text eol=lf
+*.toml          text eol=lf
+*.cfg           text eol=lf
+*.ini           text eol=lf
+*.json          text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.sh            text eol=lf
+*.svg           text eol=lf
+.env.example    text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+Dockerfile      text eol=lf
+
+# Windows scripts: CRLF
+*.ps1           text eol=crlf
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+
+# Binary files: never modify
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.webp          binary
+*.pdf           binary
+*.zip           binary
