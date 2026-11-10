@@ -357,6 +357,46 @@ class KarpathyLoop:
             "passed": returncode == 0 and not timed_out,
         }
 
+    @staticmethod
+    def _prepare_container_workspace_permissions(workspace: Path) -> None:
+        """Make a temporary workspace readable by Docker's unprivileged user.
+
+        POSIX temporary directories commonly start with mode 0700. The
+        evaluator container runs as UID/GID 65534, so its read-only bind mount
+        still needs searchable directories and readable files. Windows chmod
+        has limited POSIX semantics; Docker Desktop additionally enforces the
+        host user's file-sharing ACLs.
+        """
+
+        root = workspace.resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(
+                f"Container evaluation workspace does not exist: {root}"
+            )
+
+        entries = list(root.rglob("*"))
+        directories = [
+            root,
+            *(
+                path
+                for path in entries
+                if not path.is_symlink() and path.is_dir()
+            ),
+        ]
+        files = [
+            path
+            for path in entries
+            if not path.is_symlink() and path.is_file()
+        ]
+
+        # Set parent directories first so the unprivileged container user can
+        # traverse the tree. The bind mount itself remains read-only.
+        for directory in sorted(directories, key=lambda item: len(item.parts)):
+            os.chmod(directory, 0o755)
+
+        for file_path in files:
+            os.chmod(file_path, 0o644)
+
     def _run_container_evaluator(
         self,
         workspace: Path,
@@ -531,6 +571,10 @@ class KarpathyLoop:
                 mutated_code,
                 encoding="utf-8",
             )
+
+            # Make the workspace accessible to UID/GID 65534 before the
+            # read-only bind mount is passed to Docker.
+            self._prepare_container_workspace_permissions(root)
 
             ruler = self._run_container_evaluator(
                 root,
@@ -852,8 +896,11 @@ class KarpathyLoop:
 
             self._git(
                 "commit",
+                "--only",
                 "-m",
                 f"RSI: generation {self.generation} validated",
+                "--",
+                self._relative(self.agent_src_path),
             )
 
         except Exception:

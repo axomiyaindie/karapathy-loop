@@ -1,58 +1,76 @@
 # Contributing to karapathy-loop
 
-Thank you for your interest in contributing to **karapathy-loop**!
+Thank you for your interest in contributing to **karapathy-loop**.
 
+This guide covers the project's architecture, development environment, testing strategy, security requirements and contribution workflow. Whether you are fixing a bug, improving the evaluation system, strengthening security or experimenting with AI-driven software improvement, contributions are welcome.
 
-This document explains the project's architecture, development environment, testing strategy, security requirements, and contribution workflow.
+> [!IMPORTANT]
+> Reliability and security take priority over increasing the autonomy of the system. Changes that weaken evaluation, isolation or promotion safeguards will not be accepted, even if they make a test pass.
 
-Whether you are fixing a bug, improving the evaluation system, strengthening security, or experimenting with AI-driven software improvement, contributions are welcome.
+## Table of contents
+
+1. [About the project](#1-about-the-project)
+2. [Project architecture](#2-project-architecture)
+3. [Candidate evaluation lifecycle](#3-candidate-evaluation-lifecycle)
+4. [Development environment](#4-development-environment)
+5. [Running tests](#5-running-tests)
+6. [Contribution guidelines](#6-contribution-guidelines)
+7. [Git and promotion safeguards](#7-git-and-promotion-safeguards)
+8. [Documentation requirements](#8-documentation-requirements)
+9. [Suggested contribution areas](#9-suggested-contribution-areas)
+10. [Submitting a contribution](#10-submitting-a-contribution)
+11. [Security disclosures](#11-security-disclosures)
+12. [Project status](#12-project-status)
 
 ---
 
 ## 1. About the project
 
-`karapathy-loop` is an experimental Recursive Self-Improvement (RSI) framework.
+`karapathy-loop` is an experimental Recursive Self-Improvement (RSI) framework. It explores how an AI agent can propose modifications to its own Python software scaffolding, evaluate those modifications, and optionally promote the successful ones.
 
-It explores how an AI agent can propose modifications to its own Python software scaffolding, evaluate those modifications, and optionally promote successful candidates.
-
-The project uses an iterative software improvement process:
+The improvement process works like this:
 
 1. Inspect the current agent implementation.
 2. Generate a proposed code modification using an AI provider.
-3. Evaluate the proposed candidate against protected evaluation rubrics.
+3. Evaluate the candidate against protected evaluation rubrics.
 4. Archive unsuccessful candidates for analysis.
 5. Optionally promote a candidate that passes all required checks.
-6. Repeat the process in subsequent generations.
+6. Repeat in subsequent generations.
 
-The project modifies software code, not the internal weights of an AI model.
+> [!NOTE]
+> The project modifies **software code**, not the internal weights of an AI model.
+
+---
 
 ## 2. Project architecture
 
-The repository is organized around several main components.
+| Component | Path | Role |
+| --- | --- | --- |
+| Mutation supervisor | `src/loop/main_loop.py` | Coordinates the improvement lifecycle |
+| Context engine | `src/context/engine.py` | Manages what is sent to the AI provider |
+| Harness | `src/harness/tools.py` | Controlled access to project files and diagnostics |
+| Production agent | `src/agent/live_agent.py` | The current agent, and the target for promotion |
+| Protected evaluators | `tests/immutable_ruler.py`, `tests/run_challenge.py` | Define the evaluation contract |
 
-### `src/loop/main_loop.py`
+### Mutation supervisor: `src/loop/main_loop.py`
 
-The mutation supervisor coordinates the improvement lifecycle.
-
-Responsibilities include:
+The supervisor coordinates the improvement lifecycle. Its responsibilities include:
 
 - Managing generation state.
 - Communicating with supported AI providers.
 - Constructing mutation prompts.
 - Extracting proposed Python source.
 - Preparing temporary evaluation workspaces.
-- Running protected evaluators.
+- Running protected evaluators inside Docker.
 - Archiving unsuccessful candidates.
 - Verifying candidate integrity.
 - Managing optional Git promotion.
 
-The supervisor must fail closed when required evaluation infrastructure is unavailable.
+The supervisor **must fail closed** when required evaluation infrastructure is unavailable.
 
-### `src/context/engine.py`
+### Context engine: `src/context/engine.py`
 
-The context engine manages the information supplied to the AI provider.
-
-Responsibilities include:
+The context engine manages the information supplied to the AI provider. Its responsibilities include:
 
 - Maintaining interaction history.
 - Counting tokens with `tiktoken`.
@@ -63,27 +81,23 @@ Responsibilities include:
 
 Token counts are estimates and may differ from the tokenizer used by an external AI provider.
 
-### `src/harness/tools.py`
+### Harness: `src/harness/tools.py`
 
-The harness provides controlled access to project files and diagnostic operations.
-
-Responsibilities include:
+The harness provides controlled access to project files and diagnostic operations. Its responsibilities include:
 
 - Restricting filesystem access to approved project locations.
 - Rejecting traversal outside the repository.
 - Protecting sensitive files.
-- Allowlisting diagnostic scripts.
-- Limiting diagnostic execution time.
+- Disabling host-side evaluator execution through `run_sandbox_sub_test()`.
 
-**Important:** Filesystem path validation is an application-level security control. It is not a substitute for OS-level process isolation.
+> [!IMPORTANT]
+> Host-side evaluator execution through the harness is **disabled**. The method signature is kept for compatibility, but attempts to execute evaluator scripts through it fail closed.
 
-### `src/agent/live_agent.py`
+Filesystem path validation is an application-level security control. It is not a substitute for OS-level process isolation.
 
-This is the current production agent implementation.
+### Production agent: `src/agent/live_agent.py`
 
-It is the source from which proposed improvements are generated and the target for successful promotion.
-
-Changes to this file must satisfy both protected evaluation rubrics.
+This is the current production agent. It is the source from which proposed improvements are generated and the target for successful promotion. Changes to this file must satisfy both protected evaluation rubrics.
 
 ### Protected evaluation system
 
@@ -92,9 +106,7 @@ The project uses two protected evaluation scripts:
 - `tests/immutable_ruler.py`
 - `tests/run_challenge.py`
 
-These scripts define the evaluation contract and must remain unchanged.
-
-New regression tests should be added separately using the `test_*.py` naming convention.
+These scripts define the evaluation contract and **must remain unchanged**. Add new regression tests separately, using the `test_*.py` naming convention.
 
 ---
 
@@ -102,16 +114,26 @@ New regression tests should be added separately using the `test_*.py` naming con
 
 Every proposed source modification must be evaluated before promotion.
 
+```mermaid
+flowchart TD
+    A["Generate candidate source"] --> B["Record SHA-256 hash of candidate"]
+    B --> C["Place identical source in<br/>.agent_sandbox/temp_agent.py and<br/>src/agent/live_agent.py (temporary workspace)"]
+    C --> D["Run both protected evaluators<br/>inside restricted Docker container"]
+    D -->|any failure or Docker unavailable| E["Fail closed and archive candidate"]
+    D -->|both rubrics pass| F["Verify hash still matches"]
+    F -->|mismatch| E
+    F -->|match| G["Optional promotion<br/>(explicit opt-in only)"]
+```
+
 The supervisor prepares a temporary workspace and places the exact same candidate source in both expected locations:
 
 - `.agent_sandbox/temp_agent.py`
 - `src/agent/live_agent.py`
 
-Both unchanged evaluators then run against that candidate inside Docker.
+Both unchanged evaluators then run against that candidate inside Docker. The system records a SHA-256 hash of the original candidate source.
 
-The evaluation system records a SHA-256 hash of the original candidate source.
-
-Promotion must use the exact candidate that passed evaluation. A candidate must never be silently modified between evaluation and promotion.
+> [!WARNING]
+> Promotion must use the exact candidate that passed evaluation. A candidate must never be silently modified between evaluation and promotion.
 
 ### Evaluation requirements
 
@@ -119,25 +141,27 @@ Candidate evaluation must:
 
 - Execute both protected rubrics.
 - Use the same candidate source for both evaluations.
-- Run inside the OS-isolated container path.
+- Run inside the restricted Docker container.
 - Mount evaluation inputs read-only.
 - Disable container networking.
-- Apply CPU, memory, and process limits.
+- Apply CPU, memory and process limits.
 - Apply a timeout.
 - Avoid passing provider credentials or Git credentials.
-- Avoid mounting the host Git directory or Docker socket.
+- Avoid mounting the host Git directory or the Docker socket.
 - Clean up evaluation containers after execution.
 - Fail closed if Docker is unavailable or evaluation fails.
 
-Do not replace Docker-backed candidate evaluation with an ordinary Python subprocess.
+Do not replace Docker-backed candidate evaluation with an ordinary Python subprocess. A temporary directory alone does not provide process isolation.
 
-A temporary directory alone does not provide process isolation.
+### Host-side evaluator execution
+
+The harness disables host-side evaluator execution through `run_sandbox_sub_test()`. This restriction applies to execution **through the harness**. It does not mean the protected evaluator scripts are incapable of running directly on the host.
+
+Optional manual evaluator commands can still be used to check the current production agent. Those commands execute on the host and **do not provide container isolation**. Do not treat direct host execution as a substitute for Docker-backed candidate evaluation.
 
 ### Docker security
 
-The container is a defense-in-depth boundary, not a guarantee against every possible escape.
-
-The Docker daemon, host operating system, kernel, and container image remain part of the trusted computing base.
+The container is a defense-in-depth boundary, not a guarantee against every possible escape. The Docker daemon, host operating system, kernel and container image remain part of the trusted computing base.
 
 Contributors working on the evaluation infrastructure should pay particular attention to:
 
@@ -158,51 +182,73 @@ Never weaken these protections to make a test pass.
 
 ### Requirements
 
-Development is currently documented for Windows using PowerShell.
+The project targets Windows, macOS and Linux.
+
+The current development and verification record covers **Windows with Python 3.12 and Docker Desktop using WSL2 Linux containers**. macOS and Linux compatibility are development goals and must be tested on their native environments before being described as fully verified.
 
 You will need:
 
 - Python 3.12
 - Git
-- Docker Desktop with Linux containers
-- A supported AI provider account for live supervisor experiments
+- Docker Engine or Docker Desktop with Linux container support
+- A supported AI provider account, only for live supervisor experiments
 
 The normal regression test suite should not require provider credentials or live network access.
 
 ### Clone the repository
 
-```powershell
-git clone https://github.com/axomiyaindie/karapathy-loop.git
+If you plan to submit changes, [fork the repository](https://github.com/axomiyaindie/karapathy-loop/fork) first and clone your fork. The commands work in PowerShell, Terminal and other shells:
+
+```bash
+git clone https://github.com/<your-username>/karapathy-loop.git
 cd karapathy-loop
 ```
 
 ### Create a virtual environment
+
+**Windows (PowerShell)**
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
+**macOS or Linux (Terminal)**
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+```
+
 ### Install dependencies
 
-```powershell
+On all platforms:
+
+```bash
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
 ### Configure local environment variables
 
-Create a local configuration file:
+Create a local configuration file.
+
+**Windows (PowerShell)**
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Edit `.env` with your local provider configuration.
+**macOS or Linux (Terminal)**
 
-Never commit `.env`, API keys, tokens, passwords, or other credentials.
+```bash
+cp .env.example .env
+```
 
-Use `.env.example` for placeholder configuration only.
+Edit `.env` with your local provider configuration. Use `.env.example` for placeholder configuration only.
+
+> [!CAUTION]
+> Never commit `.env`, API keys, tokens, passwords or other credentials.
 
 ---
 
@@ -210,20 +256,37 @@ Use `.env.example` for placeholder configuration only.
 
 Run the regression suite from the repository root:
 
-```powershell
+```bash
 python -m pytest -v
 ```
 
-Run the protected evaluators directly:
+The latest reported Windows regression run completed with **33 passed, 0 failed**. This is a Windows result, not proof that the suite passes on every supported operating system.
+
+### Optional manual evaluator checks
+
+The protected evaluators can also be run directly against the current production agent. First, prepare the expected candidate location.
+
+**Windows (PowerShell)**
 
 ```powershell
+New-Item -ItemType Directory -Force .agent_sandbox | Out-Null
+Copy-Item src\agent\live_agent.py .agent_sandbox\temp_agent.py -Force
+
+python tests\immutable_ruler.py
+python tests\run_challenge.py
+```
+
+**macOS or Linux (Terminal)**
+
+```bash
+mkdir -p .agent_sandbox
+cp src/agent/live_agent.py .agent_sandbox/temp_agent.py
+
 python tests/immutable_ruler.py
 python tests/run_challenge.py
 ```
 
-These direct commands test the current production agent on the host. They do not independently verify Docker isolation.
-
-The supervisor's Docker-backed evaluation is responsible for testing proposed candidates inside the restricted container.
+These commands execute the unchanged evaluator scripts directly on the host against the current production agent. They are optional manual checks and **do not provide container isolation**. Proposed candidates must be evaluated through the supervisor's Docker-backed workflow.
 
 ### Testing requirements
 
@@ -239,9 +302,7 @@ Regression tests must:
 - Clean up temporary files and resources.
 - Verify failure conditions as well as successful execution.
 
-When changing the supervisor, add regression tests for the relevant failure cases.
-
-Examples include:
+When changing the supervisor, add regression tests for the relevant failure cases, for example:
 
 - Empty or invalid model responses.
 - Provider authentication failures.
@@ -253,8 +314,22 @@ Examples include:
 - Git commit failures.
 - Git push failures.
 - Secret detection and redaction.
+- Workspace permission failures.
+- Cross-platform path handling.
 
 Do not introduce a test that makes an actual provider request or performs a real remote Git operation.
+
+### Cross-platform testing
+
+Run the regression suite on the operating systems affected by your change. The platform matrix is:
+
+| Platform | Verification status |
+| --- | --- |
+| Windows | Regression suite passed: 33 tests |
+| macOS | Not yet verified |
+| Linux | Not yet verified |
+
+Docker integration must also be checked separately. Passing mocked or unit tests does not prove that real Docker bind mounts, permissions, timeouts and cleanup work on every platform.
 
 ---
 
@@ -268,33 +343,21 @@ Do not introduce a test that makes an actual provider request or performs a real
 4. Identify the component affected by your change.
 5. Review related tests before modifying implementation code.
 
-Preserve existing public interfaces unless a change is explicitly justified and documented.
-
-Prefer focused, incremental modifications over unnecessary architectural rewrites.
+Preserve existing public interfaces unless a change is explicitly justified and documented. Prefer focused, incremental modifications over unnecessary architectural rewrites.
 
 ### Adding regression tests
 
-Place new tests in the `tests/` directory.
-
-Use names beginning with:
-
-```text
-test_*.py
-```
-
-For example:
+Place new tests in the `tests/` directory and name them `test_*.py`. For example:
 
 ```text
 tests/
-    immutable_ruler.py
-    run_challenge.py
+    immutable_ruler.py        (protected, do not modify)
+    run_challenge.py          (protected, do not modify)
     conftest.py
     test_context_engine.py
     test_harness_security.py
     test_supervisor.py
 ```
-
-The two protected evaluator scripts must not be modified.
 
 If you discover a weakness in a protected evaluator, document the finding and discuss the required change separately rather than silently changing the rubric.
 
@@ -318,9 +381,7 @@ Avoid introducing unnecessary dependencies.
 
 ## 7. Git and promotion safeguards
 
-Git promotion is a sensitive part of this project.
-
-The supervisor must never overwrite unrelated developer changes.
+Git promotion is a sensitive part of this project. The supervisor must never overwrite unrelated developer changes.
 
 Before enabling commits:
 
@@ -330,22 +391,12 @@ Before enabling commits:
 4. Stage only `src/agent/live_agent.py`.
 5. Commit only after both protected rubrics pass.
 
-Never use broad commands such as:
-
-```powershell
-git reset --hard
-git clean -fd
-```
-
-These commands can destroy unrelated user work.
-
-Recovery operations must target only the specific file and index entry involved in the failed promotion.
+> [!WARNING]
+> Never use broad commands such as `git reset --hard` or `git clean -fd` in promotion or recovery code. They can destroy unrelated user work. Recovery operations must target only the specific file and index entry involved in the failed promotion.
 
 ### Push behavior
 
-A failed remote push must leave a successful local commit intact.
-
-Do not automatically undo a successful local commit simply because an upstream push failed.
+A failed remote push must leave a successful local commit intact. Do not automatically undo a successful local commit simply because an upstream push failed.
 
 ### Default promotion configuration
 
@@ -356,11 +407,7 @@ RSI_AUTO_COMMIT=false
 RSI_AUTO_PUSH=false
 ```
 
-Automatic commits require explicit opt-in.
-
-Remote pushes additionally require explicit opt-in.
-
-Contributors must not enable automatic promotion as part of ordinary regression testing.
+Automatic commits require explicit opt-in, and remote pushes require a separate explicit opt-in. Do not enable automatic promotion as part of ordinary regression testing.
 
 ---
 
@@ -377,63 +424,38 @@ Update documentation when a contribution changes:
 - Dependencies.
 - Development workflows.
 
-Keep the README beginner-friendly.
+Keep the README beginner-friendly. Use this document for technical architecture, development details, testing procedures and contribution requirements.
 
-Use this document for technical architecture, development details, testing procedures, and contribution requirements.
+Documentation must distinguish between:
+
+- Features that are implemented.
+- Features that have passed automated tests.
+- Features that have passed actual integration tests.
+- Features that are planned but not yet verified.
+
+Do not describe cross-platform behavior as verified unless the relevant platform tests have actually been completed.
 
 ---
 
 ## 9. Suggested contribution areas
 
-There are several areas where contributions can improve the project.
+These are suggestions, not a requirement to implement any particular feature.
 
-### Evaluation and sandbox security
-
-- Stronger container isolation.
-- Verified and pinned container images.
-- Better timeout and cleanup handling.
-- Additional security regression tests.
-- Improved failure reporting.
-
-### Context engineering
-
-- Better diagnostic prioritization.
-- More efficient context compression.
-- Improved token-budget management.
-- Duplicate detection and history handling.
-
-### Mutation supervisor
-
-- More reliable provider response handling.
-- Better candidate validation.
-- Stronger promotion safeguards.
-- Improved mutation metadata and archiving.
-
-### Testing and reliability
-
-- More regression coverage.
-- Better failure simulation.
-- Cross-platform compatibility.
-- Improved integration testing.
-
-### Documentation
-
-- Clearer setup instructions.
-- Better architecture explanations.
-- More examples.
-- Troubleshooting guides.
-
-These are suggested areas, not a requirement to implement any particular feature.
+| Area | Ideas |
+| --- | --- |
+| **Evaluation and sandbox security** | Stronger container isolation; verified and pinned container images; better timeout and cleanup handling; more security regression tests; improved failure reporting |
+| **Context engineering** | Better diagnostic prioritization; more efficient context compression; improved token-budget management; duplicate detection and history handling |
+| **Mutation supervisor** | More reliable provider response handling; better candidate validation; stronger promotion safeguards; improved mutation metadata and archiving |
+| **Testing and reliability** | More regression coverage; better failure simulation; cross-platform compatibility; improved integration testing |
+| **Documentation** | Clearer setup instructions; better architecture explanations; more examples; troubleshooting guides |
 
 ---
 
 ## 10. Submitting a contribution
 
-A typical contribution workflow is:
-
 ### Step 1: Create a branch
 
-```powershell
+```bash
 git checkout -b feature/your-change
 ```
 
@@ -447,25 +469,23 @@ Create or update tests without changing the protected rubrics.
 
 ### Step 4: Run the test suite
 
-```powershell
+```bash
 python -m pytest -v
 ```
 
 ### Step 5: Check your diff
 
-```powershell
+```bash
 git diff --check
 git status
 git diff
 ```
 
-Review the final changes and make sure no secrets, generated runtime files, or unrelated modifications are included.
+Review the final changes and make sure no secrets, generated runtime files or unrelated modifications are included.
 
 ### Step 6: Submit a pull request
 
-Push your feature branch to your fork and open a pull request against the main repository:
-
-https://github.com/axomiyaindie/karapathy-loop
+Push your feature branch to your fork and open a pull request against the [main repository](https://github.com/axomiyaindie/karapathy-loop).
 
 Describe:
 
@@ -477,26 +497,33 @@ Describe:
 
 For security-sensitive changes, explain the threat being addressed and how the new implementation prevents it.
 
+### Pull request checklist
+
+- [ ] The change is focused and limited to what is needed.
+- [ ] `python -m pytest -v` passes.
+- [ ] New or changed behavior has regression tests, including failure cases.
+- [ ] `tests/immutable_ruler.py` and `tests/run_challenge.py` are unchanged.
+- [ ] No secrets, `.env` files or generated runtime files are included.
+- [ ] Docker isolation and fail-closed behavior are not weakened.
+- [ ] Documentation is updated where needed.
+- [ ] Cross-platform claims reflect what was actually tested.
+
 ---
 
 ## 11. Security disclosures
 
-Please do not publish exploitable security vulnerabilities, credentials, API keys, or sensitive information in public issues.
+Please do **not** publish exploitable security vulnerabilities, credentials, API keys or sensitive information in public issues.
 
-Provide enough information for the maintainers to investigate the problem safely.
+Provide enough information for the maintainers to investigate the problem safely. If the repository has private vulnerability reporting enabled, use the **Security** tab and choose **Report a vulnerability**. Otherwise, contact the maintainer through their GitHub profile without including exploit details in public.
 
-Never include real secrets in bug reports, test fixtures, or pull requests.
+Never include real secrets in bug reports, test fixtures or pull requests.
 
 ---
 
 ## 12. Project status
 
-`karapathy-loop` is an experimental project under active development.
-
-Its goal is to explore controlled, test-driven approaches to AI-driven software improvement.
+`karapathy-loop` is an experimental project under active development. Its goal is to explore controlled, test-driven approaches to AI-driven software improvement.
 
 Contributions are welcome, but reliability and security take priority over increasing the autonomy of the system.
 
 **Thank you for helping improve karapathy-loop.**
-
----

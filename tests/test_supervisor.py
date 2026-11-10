@@ -1,8 +1,9 @@
-
 from pathlib import Path
 import hashlib
 import os
 import subprocess
+
+import pytest
 
 from loop.main_loop import KarpathyLoop
 
@@ -189,7 +190,17 @@ def test_failed_push_preserves_successful_local_commit(tmp_path):
     tested_hash = hashlib.sha256(b"new source").hexdigest()
 
     assert loop.commit_improvement("new source", tested_hash) is False
-    assert any(call[:1] == ("commit",) for call in calls)
+
+    commit_calls = [call for call in calls if call[:1] == ("commit",)]
+    assert len(commit_calls) == 1
+    assert commit_calls[0] == (
+        "commit",
+        "--only",
+        "-m",
+        "RSI: generation 4 validated",
+        "--",
+        "src/agent/live_agent.py",
+    )
     assert any(call[:1] == ("push",) for call in calls)
 
 
@@ -307,3 +318,81 @@ def test_promotion_exception_after_passed_evaluation_increments_generation(
     assert loop.generation == 4
     assert os.environ["AGENT_GEN"] == "4"
     assert len(archived) == 1
+
+
+def test_container_workspace_permissions_support_unprivileged_docker_user(tmp_path):
+    workspace = tmp_path / "evaluation-workspace"
+    tests_dir = workspace / "tests"
+    tests_dir.mkdir(parents=True)
+    evaluator = tests_dir / "evaluator.py"
+    evaluator.write_text("print('ok')\n", encoding="utf-8")
+
+    KarpathyLoop._prepare_container_workspace_permissions(workspace)
+
+    assert os.access(workspace, os.R_OK | os.X_OK)
+    assert os.access(tests_dir, os.R_OK | os.X_OK)
+    assert os.access(evaluator, os.R_OK)
+
+    # POSIX filesystems expose the permission bits Docker's UID 65534 uses.
+    # Windows relies on host ACLs and Docker Desktop file sharing instead.
+    if os.name != "nt":
+        import stat
+
+        assert stat.S_IMODE(workspace.stat().st_mode) == 0o755
+        assert stat.S_IMODE(tests_dir.stat().st_mode) == 0o755
+        assert stat.S_IMODE(evaluator.stat().st_mode) == 0o644
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "api_key = 'example-secret-value-123'",
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456",
+        "sk-abcdefghijklmnopqrstuvwxyz123456",
+        "github_pat_abcdefghijklmnopqrstuvwxyz123456",
+        "ghp_abcdefghijklmnopqrstuvwxyz123456",
+        "AIza0123456789abcdefghijklmnopqrstuvwxyz",
+        "xox" + "b-1234567890-abcdefghijklmnop",
+        "AKIA1234567890ABCDEF",
+        (
+            "-----BEGIN PRIVATE KEY-----\n"
+            "FAKE-PRIVATE-KEY-MATERIAL\n"
+            "-----END PRIVATE KEY-----"
+        ),
+    ],
+    ids=[
+        "credential-assignment",
+        "bearer-token",
+        "api-token",
+        "github-fine-grained-token",
+        "github-classic-token",
+        "google-api-key",
+        "slack-token",
+        "aws-access-key-id",
+        "pem-private-key",
+    ],
+)
+def test_known_credential_formats_are_rejected_and_redacted(credential):
+    loop = KarpathyLoop.__new__(KarpathyLoop)
+
+    with pytest.raises(PermissionError):
+        loop._reject_secret_like_code(credential)
+
+    redacted = loop._redact_sensitive(credential)
+    assert credential not in redacted
+    assert "[REDACTED" in redacted
+
+
+def test_configured_environment_secret_is_rejected_and_redacted(monkeypatch):
+    loop = KarpathyLoop.__new__(KarpathyLoop)
+    secret_value = "unit-test-secret-value-987654"
+    monkeypatch.setenv("RSI_TEST_API_TOKEN", secret_value)
+
+    with pytest.raises(PermissionError):
+        loop._reject_secret_like_code(f"token = '{secret_value}'")
+
+    redacted = loop._redact_sensitive(f"token = '{secret_value}'")
+    assert secret_value not in redacted
+    assert (
+    "[REDACTED_ENV_VALUE]" in redacted
+    or "[REDACTED_CREDENTIAL_ASSIGNMENT]" in redacted
+)
