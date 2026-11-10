@@ -2,8 +2,6 @@
   <img src="assets/karapathy-loop.svg" alt="karapathy-loop logo" width="560">
 </p>
 
-<h1 align="center">karapathy-loop</h1>
-
 <p align="center">
   <strong>A recursive self-improvement agent framework</strong><br>
   <em>Propose · Evaluate · Improve</em>
